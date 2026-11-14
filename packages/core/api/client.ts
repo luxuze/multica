@@ -813,6 +813,9 @@ function subscriberTarget(
  */
 type WorkspaceScope = string | { workspaceId: string };
 
+/** `readOnly` marks a POST that changes nothing on the server. */
+type ApiRequestInit = RequestInit & { readOnly?: boolean };
+
 function workspaceHeader(
   scope?: WorkspaceScope,
 ): Record<string, string> | undefined {
@@ -837,6 +840,9 @@ function dingTalkGroupSearch(params: ListDingTalkGroupsParams): string {
 // (server/internal/middleware/auth.go). Matched rather than inferred from the
 // status, because 403 also covers real authorization failures that must not
 // be retried.
+/** The most groups `POST /api/inbox/archive-updates` takes in one request. */
+const INBOX_ARCHIVE_UPDATES_MAX_GROUPS = 500;
+
 const CSRF_REJECTED_ERROR = "CSRF validation failed";
 
 // One header, two possible values — see ApiClient.readCsrfValue.
@@ -1001,11 +1007,14 @@ export class ApiClient {
   // path, plain text for the attachment-preview proxy, etc.
   private async fetchRaw(
     path: string,
-    init?: RequestInit & { extraHeaders?: Record<string, string> },
+    init?: ApiRequestInit & { extraHeaders?: Record<string, string> },
   ): Promise<Response> {
     const rid = createRequestId();
     const start = Date.now();
     const method = init?.method ?? "GET";
+    const observer = getApiRequestObserver();
+    const refusal = observer?.refuse?.({ method, path, readOnly: init?.readOnly === true });
+    if (refusal) throw new Error(refusal);
 
     // Rebuilt per attempt rather than captured once: authHeaders() reads the
     // CSRF cookie at call time, and the retry below exists precisely because
@@ -1023,7 +1032,6 @@ export class ApiClient {
 
     this.logger.info(`→ ${method} ${path}`, { rid });
 
-    const observer = getApiRequestObserver();
     observer?.onStart({
       requestId: rid,
       method,
@@ -1031,10 +1039,11 @@ export class ApiClient {
       body: typeof init?.body === "string" ? init.body : null,
     });
 
+    const { readOnly: _readOnly, ...requestInit } = init ?? {};
     const send = async () => {
       try {
         return await fetch(`${this.baseUrl}${path}`, {
-          ...init,
+          ...requestInit,
           headers: buildHeaders(),
           credentials: "include",
         });
@@ -1086,7 +1095,7 @@ export class ApiClient {
     return res;
   }
 
-  private async fetch<T>(path: string, init?: RequestInit): Promise<T> {
+  private async fetch<T>(path: string, init?: ApiRequestInit): Promise<T> {
     const res = await this.fetchRaw(path, {
       ...init,
       extraHeaders: { "Content-Type": "application/json" },
@@ -1357,6 +1366,7 @@ export class ApiClient {
   async listIssueTableGroups(params: IssueTableGroupsRequest): Promise<IssueTableGroupsResponse> {
     const raw = await this.fetch<unknown>("/api/issues/table/groups", {
       method: "POST",
+      readOnly: true,
       body: JSON.stringify(params),
     });
     return parseWithFallback(
@@ -1370,6 +1380,7 @@ export class ApiClient {
   async listIssueTableRows(params: IssueTableRowsRequest): Promise<IssueTableRowsResponse> {
     const raw = await this.fetch<unknown>("/api/issues/table/rows", {
       method: "POST",
+      readOnly: true,
       body: JSON.stringify(params),
     });
     return parseWithFallback(
@@ -1383,6 +1394,7 @@ export class ApiClient {
   async listIssueTableFacets(params: IssueTableFacetsRequest): Promise<IssueTableFacetsResponse> {
     const raw = await this.fetch<unknown>("/api/issues/table/facets", {
       method: "POST",
+      readOnly: true,
       body: JSON.stringify(params),
     });
     return parseWithFallback(
@@ -1838,6 +1850,7 @@ export class ApiClient {
   async previewCommentTriggers(issueId: string, content: string, parentId?: string, editingCommentId?: string): Promise<CommentTriggerPreview> {
     const raw = await this.fetch<unknown>(`/api/issues/${issueId}/comments/trigger-preview`, {
       method: "POST",
+      readOnly: true,
       body: JSON.stringify({
         content,
         ...(parentId ? { parent_id: parentId } : {}),
@@ -1856,6 +1869,7 @@ export class ApiClient {
   async previewIssueTrigger(params: IssueTriggerPreviewParams): Promise<IssueTriggerPreview> {
     const raw = await this.fetch<unknown>("/api/issues/preview-trigger", {
       method: "POST",
+      readOnly: true,
       body: JSON.stringify({
         ...(params.issueIds?.length ? { issue_ids: params.issueIds } : {}),
         ...(params.isCreate ? { is_create: true } : {}),
@@ -2174,7 +2188,7 @@ export class ApiClient {
   }
 
   async listQoderEnvironments(wsId: string, token: string, baseUrl: string, signal?: AbortSignal) {
-    return parseQoderCatalog(await this.fetch(`/api/workspaces/${wsId}/qoder/environments`, { method: "POST", body: JSON.stringify({ qoder_token: token, base_url: baseUrl }), signal }));
+    return parseQoderCatalog(await this.fetch(`/api/workspaces/${wsId}/qoder/environments`, { method: "POST", readOnly: true, body: JSON.stringify({ qoder_token: token, base_url: baseUrl }), signal }));
   }
   async listQoderAgents(wsId: string) {
     return parseQoderCatalog(await this.fetch(`/api/workspaces/${wsId}/qoder/agents`));
@@ -3120,8 +3134,11 @@ export class ApiClient {
   }
 
   // Inbox
+  // `include_snoozed` asks for the rows the Snoozed section shows. The server
+  // leaves them out for a client that does not ask, which would otherwise list
+  // a snoozed issue as plainly unread.
   async listInbox(): Promise<InboxItem[]> {
-    const raw = await this.fetch<unknown>("/api/inbox");
+    const raw = await this.fetch<unknown>("/api/inbox?include_snoozed=true");
     return parseWithFallback(raw, InboxItemListSchema, EMPTY_INBOX_ITEMS, {
       endpoint: "GET /api/inbox",
     });
@@ -3188,6 +3205,21 @@ export class ApiClient {
     return this.fetch(`/api/inbox/${id}/unarchive`, { method: "POST" });
   }
 
+  /**
+   * Snooze the item's issue until `until` (an ISO time). Issue-level, like
+   * archive: every active row on the issue goes with it.
+   */
+  async snoozeInbox(id: string, until: string): Promise<void> {
+    await this.fetch(`/api/inbox/${id}/snooze`, {
+      method: "POST",
+      body: JSON.stringify({ until }),
+    });
+  }
+
+  async unsnoozeInbox(id: string): Promise<void> {
+    await this.fetch(`/api/inbox/${id}/unsnooze`, { method: "POST" });
+  }
+
   // Raw unread ROW count — not the number any badge shows. The inbox renders
   // one row per issue, so a single issue with three unread notifications
   // counts once there and three times here. `getInboxUnreadSummary` is the
@@ -3198,19 +3230,15 @@ export class ApiClient {
     return this.fetch("/api/inbox/unread-count");
   }
 
-  // Cross-workspace unread summary: one entry per workspace the user belongs
-  // to that has unread inbox items. Backs the workspace-switcher dot for
-  // OTHER workspaces. Schema-guarded so a contract drift hides the dot rather
-  // than crashing the sidebar.
+  // Cross-workspace inbox summary: one entry per workspace the user belongs
+  // to that has unread items or issues waiting on them. Backs the Inbox badge
+  // and the workspace-switcher dot for OTHER workspaces. Schema-guarded so a
+  // contract drift hides them rather than crashing the sidebar.
   async getInboxUnreadSummary(): Promise<InboxWorkspaceUnread[]> {
     const raw = await this.fetch<unknown>("/api/inbox/unread-summary");
     return parseWithFallback(raw, InboxUnreadSummarySchema, EMPTY_INBOX_UNREAD_SUMMARY, {
       endpoint: "GET /api/inbox/unread-summary",
     });
-  }
-
-  async markAllInboxRead(): Promise<{ count: number }> {
-    return this.fetch("/api/inbox/mark-all-read", { method: "POST" });
   }
 
   /**
@@ -3226,16 +3254,22 @@ export class ApiClient {
     });
   }
 
-  async archiveAllInbox(): Promise<{ count: number }> {
-    return this.fetch("/api/inbox/archive-all", { method: "POST" });
-  }
-
-  async archiveAllReadInbox(): Promise<{ count: number }> {
-    return this.fetch("/api/inbox/archive-all-read", { method: "POST" });
-  }
-
-  async archiveCompletedInbox(): Promise<{ count: number }> {
-    return this.fetch("/api/inbox/archive-completed", { method: "POST" });
+  /**
+   * Archive issues that only carry updates. `groups` are list keys
+   * (`issue_id ?? id`). The server re-checks each one and leaves it when it
+   * has since gained something addressed to the user or was snoozed; with
+   * `readOnly`, also when its newest update is unread.
+   */
+  async archiveInboxUpdates(groups: readonly string[], readOnly: boolean): Promise<void> {
+    for (let start = 0; start < groups.length; start += INBOX_ARCHIVE_UPDATES_MAX_GROUPS) {
+      await this.fetch("/api/inbox/archive-updates", {
+        method: "POST",
+        body: JSON.stringify({
+          groups: groups.slice(start, start + INBOX_ARCHIVE_UPDATES_MAX_GROUPS),
+          read_only: readOnly,
+        }),
+      });
+    }
   }
 
   // Notification preferences
@@ -3535,6 +3569,7 @@ export class ApiClient {
   async previewPlugin(workspaceId: string, request: PluginPreviewRequest): Promise<PluginPreview> {
     const raw = await this.fetch<unknown>(`/api/workspaces/${workspaceId}/plugins/preview`, {
       method: "POST",
+      readOnly: true,
       body: JSON.stringify(request),
     });
     return parseWithFallback(raw, PluginPreviewSchema, EMPTY_PLUGIN_PREVIEW, {
@@ -4665,6 +4700,7 @@ export class ApiClient {
   async dryRunProjectWorkflow(projectId: string, workflowId: string | null): Promise<IssueWorkflowDryRunResponse> {
     const raw = await this.fetch<unknown>(`/api/projects/${projectId}/workflow`, {
       method: "POST",
+      readOnly: true,
       body: JSON.stringify({ workflow_id: workflowId, dry_run: true }),
     });
     return parseWithFallback(raw, IssueWorkflowDryRunResponseSchema, EMPTY_ISSUE_WORKFLOW_DRY_RUN, {
