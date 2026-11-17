@@ -1,0 +1,1 @@
+Captured from 385a6a2f456e95b278c881e1ff8be3a1a2855bfb. Chrome, light theme, 1280 × 720. Sign in as a fixture workspace member, open their own agent, choose Add messaging channel, then select WeChat. The QR contains a synthetic test URL.
